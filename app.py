@@ -4,7 +4,7 @@ Panneau maison pour gérer des apps Python / bots Discord.
 Lancer :  pip install flask psutil  &&  python app.py   ->  http://localhost:8080
 Premier lancement : crée ton compte administrateur sur la page de connexion.
 """
-import hashlib, json, os, re, shutil, signal, subprocess, sys, threading, time
+import getpass, hashlib, json, os, re, shutil, signal, subprocess, sys, threading, time
 from pathlib import Path
 import collections, platform, secrets
 from flask import Flask, Response, jsonify, request, session
@@ -51,6 +51,15 @@ def venv_py(d):
 def cfg(d):
     f = d / ".panel.json"
     return json.loads(f.read_text()) if f.exists() else {"entry": "main.py"}
+
+
+def save_cfg(d, **changes):
+    c = cfg(d)
+    c.update(changes)
+    (d / ".panel.json").write_text(json.dumps(c))
+
+
+URL_RE = re.compile(r"^https?://[^\s<>\"']{1,200}$")
 
 
 def status(name):
@@ -150,7 +159,9 @@ def list_apps():
     out = []
     u = cur_user()
     for d in sorted(p for p in APPS.iterdir() if p.is_dir() and (u["role"] == "admin" or p.name in u["apps"])):
-        out.append({"name": d.name, "status": status(d.name), "entry": cfg(d).get("entry", "main.py")})
+        c = cfg(d)
+        out.append({"name": d.name, "status": status(d.name), "entry": c.get("entry", "main.py"),
+                    "url": c.get("url", ""), "autostart": bool(c.get("autostart"))})
     return jsonify(out)
 
 
@@ -196,15 +207,27 @@ def control(name, action):
 @app.get("/api/apps/<name>/info")
 def info(name):
     d = app_dir(name)
-    return jsonify(name=name, status=status(name), entry=cfg(d).get("entry", "main.py"))
+    c = cfg(d)
+    return jsonify(name=name, status=status(name), entry=c.get("entry", "main.py"),
+                   url=c.get("url", ""), autostart=bool(c.get("autostart")))
 
 
 @app.put("/api/apps/<name>/config")
 def set_cfg(name):
     d = app_dir(name)
-    entry = (request.json or {}).get("entry", "main.py").strip() or "main.py"
-    (d / ".panel.json").write_text(json.dumps({"entry": entry}))
-    return jsonify(ok=True)
+    j = request.json or {}
+    ch = {}
+    if "entry" in j:
+        ch["entry"] = str(j["entry"]).strip() or "main.py"
+    if "url" in j:
+        u = str(j["url"]).strip()
+        if u and not URL_RE.match(u):
+            raise ValueError("URL invalide (ex : http://192.168.1.1:8080)")
+        ch["url"] = u
+    if "autostart" in j:
+        ch["autostart"] = bool(j["autostart"])
+    save_cfg(d, **ch)
+    return jsonify(ok=True, **ch)
 
 
 @app.get("/api/apps/<name>/logs")
@@ -625,6 +648,85 @@ if psutil:
     threading.Thread(target=sampler, daemon=True).start()
 
 
+# ---------- Démarrage automatique (systemd) ----------
+# Le panneau est installé comme service systemd ; au boot il relance
+# lui-même les apps dont l'option « Démarrer au boot » est activée.
+SERVICE = "lulyo-panel.service"
+UNIT = Path("/etc/systemd/system") / SERVICE
+
+
+def have_systemd():
+    return not IS_WIN and shutil.which("systemctl") is not None and Path("/run/systemd/system").exists()
+
+
+def root_cmd(args, **kw):
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        args = ["sudo", "-n"] + args
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def unit_text():
+    return f"""[Unit]
+Description=Lulyo Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={getpass.getuser()}
+WorkingDirectory={ROOT}
+ExecStart={sys.executable} {ROOT / "app.py"}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def systemd_state():
+    if not have_systemd():
+        return {"supported": False, "installed": False, "enabled": False}
+    en = subprocess.run(["systemctl", "is-enabled", SERVICE], capture_output=True, text=True).stdout.strip()
+    return {"supported": True, "installed": UNIT.exists(), "enabled": en == "enabled",
+            "manual": f"sudo {sys.executable} {ROOT / 'app.py'}"}
+
+
+@app.get("/api/systemd")
+def systemd_get():
+    return jsonify(systemd_state())
+
+
+@app.post("/api/systemd/<action>")
+def systemd_set(action):
+    if not have_systemd():
+        raise ValueError("systemd n'est pas disponible sur cette machine")
+    if action == "install":
+        tmp = DATA / "lulyo-panel.service"
+        tmp.write_text(unit_text())
+        steps = [["cp", str(tmp), str(UNIT)], ["systemctl", "daemon-reload"], ["systemctl", "enable", SERVICE]]
+    elif action == "uninstall":
+        steps = [["systemctl", "disable", SERVICE], ["rm", "-f", str(UNIT)], ["systemctl", "daemon-reload"]]
+    else:
+        raise ValueError("Action inconnue")
+    for a in steps:
+        r = root_cmd(a)
+        if r.returncode != 0:
+            raise ValueError((r.stderr or r.stdout or "Échec").strip()[:300] +
+                             " — lance le panneau en root ou autorise sudo sans mot de passe.")
+    log("systemd_" + action, cur_user()["name"])
+    return jsonify(ok=True, **systemd_state())
+
+
+def autostart_apps():
+    for d in sorted(p for p in APPS.iterdir() if p.is_dir()):
+        try:
+            if cfg(d).get("autostart"):
+                start(d.name)
+        except Exception:
+            pass
+
+
 # ---------- Interface ----------
 @app.get("/")
 def index():
@@ -633,4 +735,5 @@ def index():
 
 
 if __name__ == "__main__":
+    autostart_apps()
     app.run(host="0.0.0.0", port=8080, threaded=True)
